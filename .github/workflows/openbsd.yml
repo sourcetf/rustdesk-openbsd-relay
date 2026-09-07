@@ -12,10 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Checkout
+      - name: Checkout (workflow repo)
         uses: actions/checkout@v6.0.2
-        with:
-          submodules: recursive
 
       - name: Add host swap
         run: |
@@ -41,20 +39,21 @@ jobs:
           prepare: |
             set -e
             RELEASE_PKG="https://cdn.openbsd.org/pub/OpenBSD/7.9/packages/amd64"
+            # -Iv: never prompt. rust=gmake llvm19 libsodium git+pkg deps
             pkg_add -Iv -m "$RELEASE_PKG" rust gmake "llvm%19" libiconv bzip2 protobuf cmake libsodium git
             rustc --version
             test -x /usr/local/llvm19/bin/ld.lld
-            # Create adaptive swap (OpenBSD VM runs with limited disk)
+            test -x /usr/local/llvm19/bin/clang
+            # Adaptive swap for build RAM pressure
             FREE_MB=$(df -k /var | awk 'NR==2 {print int($4/1024)}')
-            RESERVE_MB=8192
-            SWAP_MB=$((FREE_MB - RESERVE_MB))
-            if [ "$SWAP_MB" -gt 12288 ]; then SWAP_MB=12288; fi
+            SWAP_MB=$((FREE_MB > 12288 ? 12288 : (FREE_MB - 8192)))
             if [ "$SWAP_MB" -lt 2048 ]; then SWAP_MB=4096; fi
             echo "Creating ${SWAP_MB}MB swap"
             dd if=/dev/zero of=/var/swap.img bs=1m count="$SWAP_MB" 2>/dev/null
             chmod 600 /var/swap.img
             swapctl -a /var/swap.img
             swapctl -l || true
+            df -h / /var /home || true
           run: |
             set -e
             ulimit -d unlimited 2>/dev/null || ulimit -d hard
@@ -63,9 +62,11 @@ jobs:
             export CARGO_TERM_COLOR=always
             export CARGO_INCREMENTAL=0
             export MAKE=gmake
+
+            # Single job to avoid OOM on 14GB single-core... actually 2 cores. Keep -j 1 from stm lessons
             export CARGO_BUILD_JOBS=1
 
-            # Low-memory build flags (from stm CI lessons: LTO/Opt-level 3 OOMs)
+            # Low-memory build flags (LTO/level 3 OOM on OpenBSD VM)
             export CARGO_PROFILE_RELEASE_LTO=off
             export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
             export CARGO_PROFILE_RELEASE_STRIP=false
@@ -75,25 +76,51 @@ jobs:
             export CXX=/usr/local/llvm19/bin/clang++
             export RUSTFLAGS="-C link-arg=-fuse-ld=lld -C debuginfo=0"
             export LIBCLANG_PATH=/usr/local/llvm19/lib
+            export LD_LIBRARY_PATH="/usr/local/llvm19/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-            # Patch openssl-sys to support LibreSSL 4.x (OpenBSD 7.9)
-            REGDIR=$(find /root/.cargo/registry/src -type d -name "openssl-sys-0.9.*" | head -1)
+            echo "=== Cloning rustdesk-server ==="
+            # Get the official source (pinned to v1.1.17 tag for reproducibility)
+            git clone --depth 1 --branch v1.1.17 https://github.com/rustdesk/rustdesk-server.git /tmp/rustdesk-server
+            cd /tmp/rustdesk-server
+            git submodule update --init --recursive
+            rustc --version
+            cargo --version
+
+            echo "=== Patching openssl-sys for LibreSSL 4.x ==="
+            REGDIR=$(find /root/.cargo/registry/src -type d -name "openssl-sys-0.9.*" 2>/dev/null | head -1)
+            if [ -n "$REGDIR" ]; then
+              sed -i "s/(4, 0, _) => ('4', '0', 'x'),/(4, 0, _) => ('4', '0', 'x'), (4, _, _) => ('4', '0', 'x'),/" "$REGDIR/build/main.rs"
+              grep -q "(4, _, _)" "$REGDIR/build/main.rs" && echo "openssl-sys patched OK" || echo "WARNING: patch target not found yet (will apply after first fetch)"
+            else
+              echo "openssl-sys not fetched yet; patching will run before build"
+              # Add a patch wrapper that runs sed after cargo downloads deps
+              mkdir -p /tmp/patchdir
+            fi
+
+            echo "=== Pre-patching openssl-sys (post-deps) ==="
+            # Force cargo to fetch deps first (without compiling) so registry src lands
+            cargo fetch
+            REGDIR=$(find /root/.cargo/registry/src -type d -name "openssl-sys-0.9.*" 2>/dev/null | head -1)
             if [ -n "$REGDIR" ]; then
               sed -i "s/(4, 0, _) => ('4', '0', 'x'),/(4, 0, _) => ('4', '0', 'x'), (4, _, _) => ('4', '0', 'x'),/" "$REGDIR/build/main.rs"
               grep -q "(4, _, _)" "$REGDIR/build/main.rs" && echo "openssl-sys patched OK" || echo "WARNING: patch failed"
             fi
 
-            # Build hbbs and hbbr
+            echo "=== Building hbbs + hbbr ==="
             cargo build --release --bin hbbs --bin hbbr
 
             test -x /home/build/target/release/hbbs
             test -x /home/build/target/release/hbbr
-            strip /home/build/target/release/hbbs /home/build/target/release/hbbr 2>/dev/null || true
-            mkdir -p artifacts
-            cp /home/build/target/release/hbbs artifacts/hbbs
-            cp /home/build/target/release/hbbr artifacts/hbbr
-            ls -lh artifacts/
-            file artifacts/hbbs artifacts/hbbr
+            cp /home/build/target/release/hbbs /home/build/hbbs
+            cp /home/build/target/release/hbbr /home/build/hbbr
+            /usr/local/llvm19/bin/llvm-strip /home/build/hbbs /home/build/hbbr
+
+            mkdir -p /home/runner/work/rustdesk-openbsd-relay/rustdesk-openbsd-relay/artifacts
+            cp /home/build/hbbs /home/runner/work/rustdesk-openbsd-relay/rustdesk-openbsd-relay/artifacts/hbbs
+            cp /home/build/hbbr /home/runner/work/rustdesk-openbsd-relay/rustdesk-openbsd-relay/artifacts/hbbr
+            ls -lh /home/runner/work/rustdesk-openbsd-relay/rustdesk-openbsd-relay/artifacts/
+            file /home/runner/work/rustdesk-openbsd-relay/rustdesk-openbsd-relay/artifacts/hbbs
+            file /home/runner/work/rustdesk-openbsd-relay/rustdesk-openbsd-relay/artifacts/hbbr
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v7
