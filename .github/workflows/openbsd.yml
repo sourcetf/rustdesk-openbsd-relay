@@ -80,7 +80,7 @@ jobs:
 
             echo "=== Cloning rustdesk-server ==="
             # Get the official source (pinned to v1.1.16 tag for reproducibility)
-            git clone --depth 1 --branch v1.1.16 https://github.com/rustdesk/rustdesk-server.git /tmp/rustdesk-server
+            git clone --depth 1 --branch 1.1.16 https://github.com/rustdesk/rustdesk-server.git /tmp/rustdesk-server
             cd /tmp/rustdesk-server
             git submodule update --init --recursive
             rustc --version
