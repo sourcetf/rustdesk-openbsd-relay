@@ -79,8 +79,8 @@ jobs:
             export LD_LIBRARY_PATH="/usr/local/llvm19/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
             echo "=== Cloning rustdesk-server ==="
-            # Get the official source (pinned to v1.1.17 tag for reproducibility)
-            git clone --depth 1 --branch v1.1.17 https://github.com/rustdesk/rustdesk-server.git /tmp/rustdesk-server
+            # Get the official source (pinned to v1.1.16 tag for reproducibility)
+            git clone --depth 1 --branch v1.1.16 https://github.com/rustdesk/rustdesk-server.git /tmp/rustdesk-server
             cd /tmp/rustdesk-server
             git submodule update --init --recursive
             rustc --version
