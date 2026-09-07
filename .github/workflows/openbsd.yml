@@ -1,0 +1,102 @@
+name: OpenBSD Build
+
+on:
+  workflow_dispatch:
+
+env:
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  openbsd-hbbs-hbbr:
+    name: Build hbbs + hbbr on OpenBSD 7.9
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+        with:
+          submodules: recursive
+
+      - name: Add host swap
+        run: |
+          set -eux
+          if ! swapon --show | grep -q /mnt/swapfile; then
+            sudo fallocate -l 16G /mnt/swapfile 2>/dev/null || sudo dd if=/dev/zero of=/mnt/swapfile bs=1M count=16384
+            sudo chmod 600 /mnt/swapfile
+            sudo mkswap /mnt/swapfile
+            sudo swapon /mnt/swapfile
+          fi
+          free -h
+          swapon --show
+
+      - name: Build on OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: "7.9"
+          usesh: true
+          mem: 14336
+          cpu: 4
+          sync: rsync
+          copyback: true
+          prepare: |
+            set -e
+            RELEASE_PKG="https://cdn.openbsd.org/pub/OpenBSD/7.9/packages/amd64"
+            pkg_add -Iv -m "$RELEASE_PKG" rust gmake "llvm%19" libiconv bzip2 protobuf cmake libsodium git
+            rustc --version
+            test -x /usr/local/llvm19/bin/ld.lld
+            # Create adaptive swap (OpenBSD VM runs with limited disk)
+            FREE_MB=$(df -k /var | awk 'NR==2 {print int($4/1024)}')
+            RESERVE_MB=8192
+            SWAP_MB=$((FREE_MB - RESERVE_MB))
+            if [ "$SWAP_MB" -gt 12288 ]; then SWAP_MB=12288; fi
+            if [ "$SWAP_MB" -lt 2048 ]; then SWAP_MB=4096; fi
+            echo "Creating ${SWAP_MB}MB swap"
+            dd if=/dev/zero of=/var/swap.img bs=1m count="$SWAP_MB" 2>/dev/null
+            chmod 600 /var/swap.img
+            swapctl -a /var/swap.img
+            swapctl -l || true
+          run: |
+            set -e
+            ulimit -d unlimited 2>/dev/null || ulimit -d hard
+            mkdir -p /home/build
+            export CARGO_TARGET_DIR=/home/build/target
+            export CARGO_TERM_COLOR=always
+            export CARGO_INCREMENTAL=0
+            export MAKE=gmake
+            export CARGO_BUILD_JOBS=1
+
+            # Low-memory build flags (from stm CI lessons: LTO/Opt-level 3 OOMs)
+            export CARGO_PROFILE_RELEASE_LTO=off
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+            export CARGO_PROFILE_RELEASE_STRIP=false
+            export CARGO_PROFILE_RELEASE_OPT_LEVEL=2
+
+            export CC=/usr/local/llvm19/bin/clang
+            export CXX=/usr/local/llvm19/bin/clang++
+            export RUSTFLAGS="-C link-arg=-fuse-ld=lld -C debuginfo=0"
+            export LIBCLANG_PATH=/usr/local/llvm19/lib
+
+            # Patch openssl-sys to support LibreSSL 4.x (OpenBSD 7.9)
+            REGDIR=$(find /root/.cargo/registry/src -type d -name "openssl-sys-0.9.*" | head -1)
+            if [ -n "$REGDIR" ]; then
+              sed -i "s/(4, 0, _) => ('4', '0', 'x'),/(4, 0, _) => ('4', '0', 'x'), (4, _, _) => ('4', '0', 'x'),/" "$REGDIR/build/main.rs"
+              grep -q "(4, _, _)" "$REGDIR/build/main.rs" && echo "openssl-sys patched OK" || echo "WARNING: patch failed"
+            fi
+
+            # Build hbbs and hbbr
+            cargo build --release --bin hbbs --bin hbbr
+
+            test -x /home/build/target/release/hbbs
+            test -x /home/build/target/release/hbbr
+            strip /home/build/target/release/hbbs /home/build/target/release/hbbr 2>/dev/null || true
+            mkdir -p artifacts
+            cp /home/build/target/release/hbbs artifacts/hbbs
+            cp /home/build/target/release/hbbr artifacts/hbbr
+            ls -lh artifacts/
+            file artifacts/hbbs artifacts/hbbr
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: rustdesk-server-openbsd
+          path: artifacts/
